@@ -26,7 +26,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   # by install-mac.sh names it, so it is read back out of there.
   # `|| true` because there may be no wrapper to read: pipefail would otherwise
   # make a missing file the end of the script rather than a question answered no.
-  PY="$(sed -n 's/^exec "\([^"]*\)".*/\1/p' "$BIN_DIR/dikte" 2>/dev/null | head -1 || true)"
+  PY="$(python3 -c 'import os, pathlib, shlex, sys; words = shlex.split(os.fsdecode(pathlib.Path(sys.argv[1]).read_bytes()), comments=True); print(words[words.index("exec") + 1])' "$BIN_DIR/dikte" 2>/dev/null || true)"
   [[ -x "$PY" ]] || PY="$(command -v python3 || true)"
 else
   MACOS=0
@@ -95,7 +95,7 @@ echo "──────────────────"
 if ((MACOS)); then
   say "Nothing to unregister: macOS shortcuts live only while Dikte runs."
 elif [[ -n "$PY" ]] && "$PY" -c 'import PyQt6.QtWidgets' 2>/dev/null; then
-  for which in toggle pause cancel ask meeting; do
+  for which in toggle pause cancel ask meeting assist; do
     "$PY" "$ENTRY" shortcut remove "$which" >/dev/null 2>&1 || true
   done
   case "$(PYTHONPATH="$DIR" "$PY" -c 'from dikte import hotkey; print(hotkey.backend())' 2>/dev/null)" in
@@ -177,7 +177,7 @@ if ((!MACOS)); then
   # Removing the shortcut takes its desktop file with it, but an install from
   # before this script existed may have left one behind on a desktop that never
   # used them.
-  for id in dikte-toggle dikte-pause dikte-cancel dikte-ask dikte-meeting; do
+  for id in dikte-toggle dikte-pause dikte-cancel dikte-ask dikte-meeting dikte-assist; do
     if [[ -e "$APP_DIR/$id.desktop" ]]; then
       remove "$APP_DIR/$id.desktop"
     fi

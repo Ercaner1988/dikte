@@ -10,9 +10,12 @@ from PyQt6.QtWidgets import QWidget, QApplication
 
 from . import mac_window
 from . import theme
+from .i18n import t
 
 BARS = 22
 HEIGHT = 48
+NOTE_HEIGHT = 18   # a line under a recording that says what came with it
+NOTE_LINES = 2     # how many of them a note may take before it is elided
 MIN_WIDTH = 210
 MAX_WIDTH = 460
 MARGIN = 28
@@ -73,6 +76,14 @@ def _compositor_screen():
                 None)
 
 
+def active_screen():
+    """The screen being worked on: KWin's answer, else the pointer's, else
+    the primary one. What a window opened from the tray should come up on."""
+    return (_compositor_screen()
+            or QApplication.screenAt(QCursor.pos())
+            or QApplication.primaryScreen())
+
+
 class Overlay(QWidget):
     """One indicator. Give it `below` and it stacks on top of that one instead
     of covering it, which is what lets a dictation and a command to the agent be
@@ -100,6 +111,7 @@ class Overlay(QWidget):
         self.paused = False
         self.state = "idle"
         self.message = ""
+        self.note = ""   # a line under a recording; see set_note
         self.levels = [0.0] * BARS
         self.levels2 = [0.0] * BARS   # the other side, while a meeting records
         self.seconds = 0.0
@@ -127,8 +139,8 @@ class Overlay(QWidget):
         # never reaches the window below. The flag is the one that tells the
         # display server the window has no input region at all. It is read when
         # the window is created and cannot be turned off later without the
-        # window being torn down and built again, which is why the dismissable
-        # one has to shrink itself instead (see _conceal).
+        # window being torn down and built again. Concealed indicators are
+        # unmapped in _conceal so they cannot intercept clicks.
         if dismissable:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
         else:
@@ -154,12 +166,25 @@ class Overlay(QWidget):
         recorded is a command for Claude rather than something to paste."""
         self.state = "asking" if asking else "recording"
         self.message = ""
+        self.note = ""
         self.seconds = 0.0
         self.levels = [0.0] * BARS
         self.paused = False
         self.muted = False   # a new run starts visible, whatever the last one did
         self._hide_timer.stop()
         self._appear()
+
+    def set_note(self, note):
+        """A short line under the recording's ribbon, gone with the recording.
+
+        A question about the selection says here what was read, while there
+        is still time to cancel before anything is sent.
+        """
+        self.note = note
+        if self.state in LIVE and not self._concealed:
+            self._resize_to_content()
+            self._reposition()
+        self.update()
 
     def show_meeting(self):
         """Both channels at once: your voice up, the other side down."""
@@ -216,8 +241,7 @@ class Overlay(QWidget):
 
     @property
     def showing(self):
-        """Mapped and actually painting something. The window stays mapped while
-        idle, so isVisible() alone would always say yes."""
+        """Visible and actually painting something."""
         return self.isVisible() and not self._concealed
 
     def push_level(self, level):
@@ -239,11 +263,33 @@ class Overlay(QWidget):
         it is the ribbon that has to say otherwise.
         """
         self.paused = bool(paused)
+        self._say_state()
         self.update()
 
     # ---- internals -----------------------------------------------------
 
+    def _say_state(self):
+        """The indicator's state in words, for a screen reader: its name is
+        the state, its description the message. Set on a transition only,
+        never per frame or per tick of the clock. PyQt6 wraps none of Qt's
+        accessibility event classes, so the announcement is the name-change
+        event Qt raises itself whenever the name changes."""
+        names = {"recording": t("Recording"), "asking": t("Recording a command"),
+                 "meeting": t("Recording a meeting"), "busy": t("Working"),
+                 "done": t("Done"), "warning": t("Warning"), "error": t("Failed")}
+        name = names.get(self.state, "")
+        if self.paused and self.state in LIVE:
+            name = t("Paused")
+        description = self.message or self.note
+        if name and description and self.state not in LIVE:
+            name = f"{name}. {description}"
+        if self.accessibleDescription() != description:
+            self.setAccessibleDescription(description)
+        if name and self.accessibleName() != name:
+            self.setAccessibleName(name)
+
     def _appear(self):
+        self._say_state()
         self._resize_to_content()
         self._reposition()
         if not self.isVisible():
@@ -260,39 +306,29 @@ class Overlay(QWidget):
             self._anim.start()
 
     def _conceal(self):
-        """Empty the window out instead of unmapping it.
-
-        Unmapping tears the window down and the next dictation builds a new one,
-        which makes the compositor repaint whatever sits underneath: on a tiled
-        desktop the terminal behind visibly flinches every time the indicator
-        goes away. So the window stays mapped and simply paints nothing. It has
-        to be a real repaint, not just zero opacity: with the animation stopped
-        nothing else damages the surface, and the stale frame would sit on the
-        screen until some other event made the compositor redraw it.
-
-        A window that stays mapped also stays clickable, though, and the one
-        that can be dismissed is the one that takes clicks. Left at full size it
-        would turn its corner of the screen into a dead zone long after there
-        was anything to see there, so it shrinks to a point. Resizing keeps the
-        surface alive, unlike hiding it.
-        """
+        """Unmap the window so bare X11 desktops do not show a black rectangle."""
         self._anim.stop()
         self.state = "hidden"
         self._concealed = True
-        self.repaint()
-        if self.dismissable:
-            self.resize(1, 1)
+        self.hide()
 
     def _resize_to_content(self):
+        height = HEIGHT
         if self.state in LIVE:
             # A meeting runs long enough to need an hours field.
             width = MIN_WIDTH + (24 if self.state == "meeting" else 0)
+            if self.note:
+                metrics = QFontMetrics(self._note_font())
+                lines = self._note_lines()
+                width = max(width, min(MAX_WIDTH, 32 + max(
+                    metrics.horizontalAdvance(line) for line in lines)))
+                height += NOTE_HEIGHT * len(lines)
         else:
             metrics = QFontMetrics(self._label_font())
             extra = 76 + (18 if self._can_dismiss else 0)
             width = max(MIN_WIDTH,
                         min(MAX_WIDTH, metrics.horizontalAdvance(self.message) + extra))
-        self.resize(width, HEIGHT)
+        self.resize(width, height)
 
     def _screen(self):
         """The screen this indicator belongs on right now.
@@ -316,9 +352,7 @@ class Overlay(QWidget):
             (item for item in QApplication.screens() if item.name() == self.screen_name),
             None,
         )
-        return (named or _compositor_screen()
-                or QApplication.screenAt(QCursor.pos())
-                or QApplication.primaryScreen())
+        return named or active_screen()
 
     def _wandered_off(self):
         """Whether the pointer has left the screen the indicator is on.
@@ -372,6 +406,11 @@ class Overlay(QWidget):
         font.setPointSizeF(10.5)
         return font
 
+    def _note_font(self):
+        font = QFont(self.font())
+        font.setPointSizeF(9.0)
+        return font
+
     # ---- painting --------------------------------------------------
 
     def set_theme(self, name):
@@ -405,6 +444,8 @@ class Overlay(QWidget):
         if self.state in LIVE:
             self._draw_waveform(painter, accent)
             self._draw_time(painter)
+            if self.note:
+                self._draw_note(painter)
         else:
             self._draw_message(painter)
             if self._can_dismiss:
@@ -416,7 +457,7 @@ class Overlay(QWidget):
         return self.paused and self.state in LIVE
 
     def _draw_indicator(self, painter, accent):
-        cx, cy = 26.0, self.height() / 2
+        cx, cy = 26.0, HEIGHT / 2
         painter.setPen(Qt.PenStyle.NoPen)
         if self._held:
             # The two bars everything that plays sound uses, and no glow: a
@@ -433,7 +474,17 @@ class Overlay(QWidget):
             painter.setBrush(glow)
             painter.drawEllipse(QPointF(cx, cy), 13 * pulse, 13 * pulse)
             painter.setBrush(accent)
-            painter.drawEllipse(QPointF(cx, cy), 5.5, 5.5)
+            if self.state == "asking":
+                # A sparkle rather than the dot, so the assistant reads apart
+                # from a dictation by its shape as well as its colour.
+                star = QPainterPath(QPointF(cx, cy - 8))
+                star.quadTo(cx + 1.1, cy - 1.1, cx + 8, cy)
+                star.quadTo(cx + 1.1, cy + 1.1, cx, cy + 8)
+                star.quadTo(cx - 1.1, cy + 1.1, cx - 8, cy)
+                star.quadTo(cx - 1.1, cy - 1.1, cx, cy - 8)
+                painter.drawPath(star)
+            else:
+                painter.drawEllipse(QPointF(cx, cy), 5.5, 5.5)
         elif self.state == "busy":
             painter.setBrush(Qt.BrushStyle.NoBrush)
             pen = QPen(QColor(accent), 2.4)
@@ -450,20 +501,22 @@ class Overlay(QWidget):
             painter.drawPolyline(
                 QPointF(cx - 7, cy), QPointF(cx - 2, cy + 5.5), QPointF(cx + 7.5, cy - 6)
             )
-        elif self.state == "warning":
-            pen = QPen(accent, 2.6)
-            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-            painter.setPen(pen)
-            painter.drawLine(QPointF(cx, cy - 7), QPointF(cx, cy + 1.5))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(accent)
-            painter.drawEllipse(QPointF(cx, cy + 6), 1.5, 1.5)
-        else:  # error
-            pen = QPen(accent, 2.4)
-            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-            painter.setPen(pen)
-            painter.drawLine(QPointF(cx - 6, cy - 6), QPointF(cx + 6, cy + 6))
-            painter.drawLine(QPointF(cx + 6, cy - 6), QPointF(cx - 6, cy + 6))
+        else:
+            # A warning or an error: the app's own glyph in a tinted circle,
+            # the badge the same notice wears inside the windows.
+            self._draw_badge(painter, cx, cy, "warning" if self.state == "warning" else "failed",
+                             QColor(accent))
+
+    def _draw_badge(self, painter, cx, cy, name, tone, size=28):
+        from . import widgets
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(widgets.mix(QColor(self.colors["base"]).name(), tone.name(), 0.22)))
+        painter.drawEllipse(QPointF(cx, cy), size / 2, size / 2)
+        icon = round(size * 0.55)
+        ratio = self.devicePixelRatioF() or 1.0
+        pixmap = widgets.glyph_pixmap(name, tone.name(), icon, max(2.0, ratio))
+        painter.drawPixmap(QRectF(cx - icon / 2, cy - icon / 2, icon, icon), pixmap,
+                           QRectF(pixmap.rect()))
 
     def _bars(self):
         """(x of the first bar, bar width, distance between two bars)."""
@@ -486,7 +539,7 @@ class Overlay(QWidget):
             self._draw_dual_waveform(painter)
             return
         left, bar_w, step = self._bars()
-        mid = self.height() / 2
+        mid = HEIGHT / 2
         painter.setPen(Qt.PenStyle.NoPen)
         for i, level in enumerate(self.levels):
             shaped = min(1.0, level ** 0.55)
@@ -503,7 +556,7 @@ class Overlay(QWidget):
         properly: one silent half means that side is not reaching the recording.
         """
         left, bar_w, step = self._bars()
-        mid = self.height() / 2
+        mid = HEIGHT / 2
         painter.setPen(Qt.PenStyle.NoPen)
         for i, (mine, theirs) in enumerate(zip(self.levels, self.levels2)):
             x = left + i * step
@@ -525,7 +578,7 @@ class Overlay(QWidget):
         text = f"{hours}:{mins:02d}:{secs:02d}" if hours else f"{mins}:{secs:02d}"
         width = 62 if hours else 44
         painter.drawText(
-            QRectF(self.width() - width - 12, 0, width, self.height()),
+            QRectF(self.width() - width - 12, 0, width, HEIGHT),
             int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight),
             text,
         )
@@ -537,7 +590,7 @@ class Overlay(QWidget):
     def _draw_dismiss(self, painter):
         """A faint cross on the right: without it there is nothing to say the
         box can be clicked away, and a feature nobody can see is not one."""
-        cx, cy = self.width() - 18.0, self.height() / 2
+        cx, cy = self.width() - 18.0, HEIGHT / 2
         pen = QPen(QColor(self.colors["muted"]), 1.6)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(pen)
@@ -547,12 +600,43 @@ class Overlay(QWidget):
 
     def _draw_message(self, painter):
         painter.setFont(self._label_font())
-        painter.setPen({"error": self.colors["err"], "warning": self.colors["warn"]}.get(self.state, self.colors["text"]))
+        # The words in the text colour, readable on any backdrop; the icon on
+        # the left carries the red or the amber.
+        painter.setPen(self.colors["text"])
         # Leave the cross its corner rather than running the text under it.
         box = QRectF(46, 0, self.width() - 60 - (18 if self._can_dismiss else 0),
-                     self.height())
+                     HEIGHT)
         metrics = QFontMetrics(self._label_font())
         text = metrics.elidedText(self.message, Qt.TextElideMode.ElideRight, int(box.width()))
         painter.drawText(
             box, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), text
         )
+
+    def _note_lines(self):
+        """The note broken at words to fit the widest indicator, NOTE_LINES at
+        most, the last one elided if it still runs over. A selection's preview
+        sits at the end, so it is the part that gives way, never the count."""
+        metrics = QFontMetrics(self._note_font())
+        room = MAX_WIDTH - 32
+        lines, words = [], self.note.split(" ")
+        while words and len(lines) < NOTE_LINES - 1:
+            line = words.pop(0)
+            while words and metrics.horizontalAdvance(f"{line} {words[0]}") <= room:
+                line += " " + words.pop(0)
+            if metrics.horizontalAdvance(line) > room:
+                words.insert(0, line)   # one word too long for a line alone
+                break
+            lines.append(line)
+        if words:
+            lines.append(metrics.elidedText(" ".join(words),
+                                            Qt.TextElideMode.ElideRight, room))
+        return lines
+
+    def _draw_note(self, painter):
+        painter.setFont(self._note_font())
+        painter.setPen(self.colors["muted"])
+        flags = int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        for index, line in enumerate(self._note_lines()):
+            box = QRectF(16, HEIGHT - 8 + index * NOTE_HEIGHT,
+                         self.width() - 32, NOTE_HEIGHT)
+            painter.drawText(box, flags, line)

@@ -9,6 +9,7 @@ socket is faked, and everything that runs locally runs for real.
 import contextlib
 import io
 import json
+import os
 import sys
 import unittest
 import webbrowser
@@ -315,6 +316,101 @@ class ConfigCommands(DikteTest):
         self.assertEqual(code, 0)
         self.assertEqual(cfg.Config()["cleanup_model"], cfg.DEFAULTS["cleanup_model"])
 
+    def test_setting_device_auto_restores_gpu_processing(self):
+        self.write_config({"local_device": "cpu", "local_gpu": False})
+        with mock.patch.object(ipc, "send"):
+            code, _, _ = self.run_cmd(
+                cli.cmd_config_set, key="local_device", value="auto"
+            )
+        self.assertEqual(code, 0)
+        conf = cfg.Config()
+        self.assertEqual((conf["local_device"], conf["local_gpu"]), ("auto", True))
+        conf.apply_local()
+        self.addCleanup(ggml.whisper.configure, gpu=True, device="auto")
+        self.assertTrue(ggml.whisper.settings()["gpu"])
+        self.assertEqual(ggml.whisper.settings()["device"], "auto")
+
+    def test_setting_device_cpu_disables_legacy_gpu_processing(self):
+        self.write_config({"local_device": "auto", "local_gpu": True})
+        with mock.patch.object(ipc, "send"):
+            code, _, _ = self.run_cmd(
+                cli.cmd_config_set, key="local_device", value="cpu"
+            )
+        self.assertEqual(code, 0)
+        conf = cfg.Config()
+        self.assertEqual((conf["local_device"], conf["local_gpu"]), ("cpu", False))
+        conf.apply_local()
+        self.addCleanup(ggml.whisper.configure, gpu=True, device="auto")
+        self.assertFalse(ggml.whisper.settings()["gpu"])
+
+    def test_setting_an_explicit_device_enables_legacy_gpu_processing(self):
+        device = "vulkan:00112233445566778899aabbccddeeff"
+        self.write_config({"local_device": "cpu", "local_gpu": False})
+        with mock.patch.object(ipc, "send"):
+            code, _, _ = self.run_cmd(
+                cli.cmd_config_set, key="local_device", value=device
+            )
+        self.assertEqual(code, 0)
+        conf = cfg.Config()
+        self.assertEqual((conf["local_device"], conf["local_gpu"]), (device, True))
+
+    def test_resetting_device_restores_gpu_processing(self):
+        self.write_config({"local_device": "cpu", "local_gpu": False})
+        with mock.patch.object(ipc, "send"):
+            code, _, _ = self.run_cmd(
+                cli.cmd_config_reset, key=["local_device"], all=False
+            )
+        self.assertEqual(code, 0)
+        conf = cfg.Config()
+        self.assertEqual((conf["local_device"], conf["local_gpu"]), ("auto", True))
+
+    def test_setting_the_legacy_gpu_flag_updates_the_device(self):
+        for value, expected in (("true", ("auto", True)),
+                                ("false", ("cpu", False))):
+            with self.subTest(value=value):
+                self.write_config({"local_device": "cpu", "local_gpu": False})
+                with mock.patch.object(ipc, "send"):
+                    code, _, _ = self.run_cmd(
+                        cli.cmd_config_set, key="local_gpu", value=value
+                    )
+                self.assertEqual(code, 0)
+                conf = cfg.Config()
+                self.assertEqual(
+                    (conf["local_device"], conf["local_gpu"]), expected
+                )
+
+    def test_resetting_the_legacy_gpu_flag_updates_the_device(self):
+        self.write_config({"local_device": "cpu", "local_gpu": False})
+        with mock.patch.object(ipc, "send"):
+            code, _, _ = self.run_cmd(
+                cli.cmd_config_reset, key=["local_gpu"], all=False
+            )
+        self.assertEqual(code, 0)
+        conf = cfg.Config()
+        self.assertEqual((conf["local_device"], conf["local_gpu"]), ("auto", True))
+
+    def test_enabling_the_legacy_gpu_flag_preserves_an_explicit_device(self):
+        device = "vulkan:00112233445566778899aabbccddeeff"
+        self.write_config({"local_device": device, "local_gpu": False})
+        with mock.patch.object(ipc, "send"):
+            code, _, _ = self.run_cmd(
+                cli.cmd_config_set, key="local_gpu", value="true"
+            )
+        self.assertEqual(code, 0)
+        conf = cfg.Config()
+        self.assertEqual((conf["local_device"], conf["local_gpu"]), (device, True))
+
+    def test_disabling_the_legacy_gpu_flag_replaces_an_explicit_device(self):
+        device = "vulkan:00112233445566778899aabbccddeeff"
+        self.write_config({"local_device": device, "local_gpu": True})
+        with mock.patch.object(ipc, "send"):
+            code, _, _ = self.run_cmd(
+                cli.cmd_config_set, key="local_gpu", value="false"
+            )
+        self.assertEqual(code, 0)
+        conf = cfg.Config()
+        self.assertEqual((conf["local_device"], conf["local_gpu"]), ("cpu", False))
+
     def test_resetting_nothing_asks_what_to_reset(self):
         code, _, err = self.run_cmd(cli.cmd_config_reset, key=[], all=False)
         self.assertEqual(code, 2)
@@ -324,7 +420,12 @@ class ConfigCommands(DikteTest):
         with mock.patch.object(ipc, "send"):
             self.run_cmd(cli.cmd_config_set, key="cleanup_model", value="some/model")
             self.run_cmd(cli.cmd_config_reset, key=[], all=True)
-        self.assertEqual(cfg.Config()["cleanup_model"], cfg.DEFAULTS["cleanup_model"])
+        conf = cfg.Config()
+        self.assertEqual(conf["cleanup_model"], cfg.DEFAULTS["cleanup_model"])
+        self.assertEqual(
+            (conf["local_device"], conf["local_gpu"]),
+            (cfg.DEFAULTS["local_device"], cfg.DEFAULTS["local_gpu"]),
+        )
 
     def test_where_things_are_stored(self):
         _, out, _ = self.run_cmd(cli.cmd_config_path, json=True)
@@ -410,6 +511,28 @@ class Providers(DikteTest):
                 self.assertEqual(parser.parse_args(["test-key", provider]).which,
                                  provider)
 
+    def test_deepseek_models_reaches_the_configured_endpoint(self):
+        opts = cli.build_parser().parse_args(["models", "--provider", "deepseek"])
+        self.assertEqual(opts.provider, "deepseek")
+        self.write_config({"deepseek_api_key": "test-only", "deepseek_base_url": "https://example.invalid/v1"})
+        with fake_urlopen({"data": [{"id": "deepseek-flash"}]}) as calls:
+            code, output, _ = self.run_cmd(cli.cmd_models, provider=opts.provider, transcription=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(output.strip(), "deepseek-flash")
+        self.assertEqual(calls[0].full_url, "https://example.invalid/v1/models")
+        self.assertEqual(calls[0].get_header("Authorization"), "Bearer test-only")
+
+    def test_doctor_names_missing_gateway_transcription_keys(self):
+        for name in ("groq", "requesty", "gemini"):
+            self.write_config({"transcribe_provider": name})
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(ipc, "send", return_value=None):
+                _, output, _ = self.run_cmd(cli.cmd_doctor)
+            self.assertIn(f"✗ {cfg.PRESETS[name].service} key, transcribing on", output)
+
+    def test_deepseek_has_no_transcription_model_catalog(self):
+        code, output, _ = self.run_cmd(cli.cmd_models, provider="deepseek", transcription=True)
+        self.assertEqual(code, 1)
+
     def test_the_model_list_is_read_from_the_chosen_provider(self):
         self.write_config({"groq_api_key": "gsk-test"})
         with fake_urlopen({"data": [{"id": "whisper-large-v3"}]}) as calls:
@@ -418,6 +541,16 @@ class Providers(DikteTest):
         self.assertEqual(code, 0)
         self.assertEqual(calls[0].full_url, "https://api.groq.com/openai/v1/models")
         self.assertEqual(out.strip(), "whisper-large-v3")
+
+    def test_requesty_lists_its_managed_models_ahead_of_the_catalog(self):
+        with fake_urlopen({"data": [{"id": "openai/gpt-4o-mini"}]},
+                          {"data": [{"id": "gpt-5.4-mini"}]}) as calls:
+            code, out, _ = self.run_cmd(cli.cmd_models, provider="requesty",
+                                        transcription=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(calls[1].full_url,
+                         "https://router.requesty.ai/v1/models/managed")
+        self.assertEqual(out.split(), ["gpt-5.4-mini", "openai/gpt-4o-mini"])
 
     def test_a_key_that_is_not_there_is_reported_under_its_own_name(self):
         code, out, _ = self.run_cmd(cli.cmd_test_key, which="groq")
@@ -434,6 +567,47 @@ class Providers(DikteTest):
             code, out, _ = self.run_cmd(cli.cmd_test_key, which="opencode")
         self.assertEqual(code, 0)
         self.assertIn("opencode: connection works, 1 models visible", out)
+
+    def test_deepseek_is_a_choice_and_reports_under_its_own_name(self):
+        parser = cli.build_parser()
+        self.assertEqual(
+            parser.parse_args(["test-key", "deepseek"]).which, "deepseek")
+        self.write_config({"deepseek_api_key": "sk-deepseek-test"})
+        with fake_urlopen({"data": [{"id": "deepseek-flash"}]}):
+            code, out, _ = self.run_cmd(cli.cmd_test_key, which="deepseek")
+        self.assertEqual(code, 0)
+        self.assertIn("deepseek: connection works, 1 models visible", out)
+
+    def test_google_ai_studio_lists_its_chat_models_for_transcription_too(self):
+        self.write_config({"gemini_api_key": "AIza-test"})
+        catalog = {"data": [{"id": "models/gemini-3.5-flash-lite"},
+                            {"id": "gemini-embedding-001"}]}
+        with fake_urlopen(catalog) as calls:
+            code, out, _ = self.run_cmd(cli.cmd_models, provider="gemini",
+                                        transcription=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(out.split(), ["gemini-3.5-flash-lite"])
+        self.assertEqual(calls[0].full_url,
+                         "https://generativelanguage.googleapis.com/v1beta/openai/models")
+
+    def test_google_ai_studio_is_tested_once_under_its_own_name(self):
+        self.write_config({"gemini_api_key": "AIza-test"})
+        with fake_urlopen({"data": [{"id": "gemini-3.5-flash-lite"}]}) as calls:
+            code, out, _ = self.run_cmd(cli.cmd_test_key, which="gemini")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(out.strip(), "✓ gemini: connection works, 1 models visible")
+
+    def test_requesty_is_a_choice_and_reports_under_its_own_name(self):
+        parser = cli.build_parser()
+        self.assertEqual(
+            parser.parse_args(["test-key", "requesty"]).which, "requesty")
+        self.write_config({"requesty_api_key": "rqsty-test"})
+        with fake_urlopen({"data": [{"id": "openai/gpt-4o-mini"}]}) as calls:
+            code, out, _ = self.run_cmd(cli.cmd_test_key, which="requesty")
+        self.assertEqual(code, 0)
+        self.assertIn("requesty: connection works, 1 models visible", out)
+        self.assertEqual(calls[0].full_url, "https://router.requesty.ai/v1/models")
 
 
 class Updates(DikteTest):
@@ -518,11 +692,31 @@ class Doctor(DikteTest):
     def test_cleanup_on_opencode_is_a_question_about_its_own_key(self):
         reply = self.run_doctor(cleanup_provider="opencode",
                                 cleanup_opencode_model="glm-5.3")
-        self.assertEqual(reply["cleanup"]["provider"], "opencode")
+        self.assertEqual(reply["cleanup"]["provider"], "custom")
         self.assertEqual(reply["cleanup"]["model"], "glm-5.3")
         self.assertIn("OpenCode Go key, cleaning up on glm-5.3",
                       self.run_doctor(as_json=False, cleanup_provider="opencode",
                                       cleanup_opencode_model="glm-5.3"))
+
+    def test_cleanup_on_deepseek_is_a_question_about_its_own_key(self):
+        reply = self.run_doctor(cleanup_provider="deepseek",
+                                cleanup_deepseek_model="deepseek-flash")
+        self.assertEqual(reply["cleanup"]["provider"], "custom")
+        self.assertEqual(reply["cleanup"]["model"], "deepseek-flash")
+        self.assertIn(
+            "DeepSeek key, cleaning up on deepseek-flash",
+            self.run_doctor(as_json=False, cleanup_provider="deepseek"),
+        )
+
+    def test_cleanup_on_requesty_is_a_question_about_its_own_key(self):
+        reply = self.run_doctor(cleanup_provider="requesty",
+                                cleanup_requesty_model="gpt-5.4-mini")
+        self.assertEqual(reply["cleanup"]["provider"], "custom")
+        self.assertEqual(reply["cleanup"]["model"], "gpt-5.4-mini")
+        self.assertIs(reply["cleanup"]["key"], False)
+        self.assertIn("Requesty key, cleaning up on gpt-5.4-mini",
+                      self.run_doctor(as_json=False, cleanup_provider="requesty",
+                                      cleanup_requesty_model="gpt-5.4-mini"))
 
     def test_it_survives_every_provider_cleanup_can_be_set_to(self):
         """It used to raise KeyError on the local model, whose executable is ""."""
@@ -579,10 +773,10 @@ class Doctor(DikteTest):
                                       cleanup_codex_model="gpt-5.4"))
 
     def test_agent_on_hosted_provider_does_not_ask_for_a_cli_program(self):
-        for provider in ("openrouter", "opencode"):
+        for provider in ("openrouter", "opencode", "requesty"):
             with self.subTest(provider=provider):
                 reply = self.run_doctor(assistant_provider=provider)
-                self.assertEqual(reply["agent"]["provider"], provider)
+                self.assertEqual(reply["agent"]["provider"], "custom" if provider in cfg.ALIASES else provider)
                 for cli_name in ("claude", "codex", "agy"):
                     self.assertNotIn(cli_name, reply["programs"])
 
@@ -590,7 +784,7 @@ class Doctor(DikteTest):
         for provider, binary in (("claude", "claude"), ("codex", "codex"), ("agy", "agy")):
             with self.subTest(provider=provider):
                 reply = self.run_doctor(assistant_provider=provider)
-                self.assertEqual(reply["agent"]["provider"], provider)
+                self.assertEqual(reply["agent"]["provider"], "custom" if provider in cfg.ALIASES else provider)
                 self.assertIn(binary, reply["programs"])
 
 
@@ -632,6 +826,21 @@ class Finding(DikteTest):
     def test_something_that_is_not_a_number(self):
         cfg.append_history({"ts": "now", "text": "only one"})
         self.assertIsNone(cli._find_history("yesterday"))
+
+    def test_deleting_a_row_sets_an_unreadable_dictionary_aside(self):
+        """The command line rewrites the dictionary file to forget the names
+        the row held; one it cannot read is kept, not replaced."""
+        from dikte import dictionary
+        cfg.append_history({"ts": "now", "raw": "on openframe",
+                            "text": "On OpenFrame."})
+        cfg.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        dictionary.path().write_text("{not json", encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = cli.cmd_history_delete(Options(which=["1"]))
+        self.assertEqual(code, 0)
+        self.assertEqual(cfg.read_history(), [])
+        self.assertEqual((cfg.CONFIG_DIR / "dictionary.json.broken")
+                         .read_text(encoding="utf-8"), "{not json")
 
     def test_a_meeting_by_its_stem(self):
         for base in ("20260801-100000", "20260802-110000"):
@@ -700,7 +909,7 @@ class WithoutAnInstance(DikteTest):
         launch.assert_called_once_with("toggle")
 
     def test_every_verb_that_opens_a_window_can_start_it(self):
-        for verb in ("home", "settings", "toggle", "ask", "meeting"):
+        for verb in ("home", "settings", "toggle", "ask", "meeting", "assist"):
             with self.subTest(verb=verb):
                 self.assertTrue(self.run_verb([verb])[3].called)
 
@@ -965,6 +1174,61 @@ class TranscribeRunsHere(DikteTest):
             cli.cmd_transcribe(opts)
 
         self.assertEqual(ggml.whisper.settings()["model"], "ggml-base.bin")
+
+    def test_the_worker_is_let_finish_its_cleanup_before_exit(self):
+        # Finished arrives before the worker removes its scratch audio, and its
+        # thread is a daemon: exiting straight away left the directory behind.
+        wav = self.path("clip.wav")
+        wav.write_bytes(b"RIFF not really audio")
+        opts = cli.build_parser().parse_args(["transcribe", str(wav)])
+        with mock.patch.object(cli.filetranscribe, "FileTranscriber") as worker, \
+                mock.patch.object(cli, "_headless",
+                                  return_value={"error": "stopped"}), \
+                captured():
+            cli.cmd_transcribe(opts)
+        worker.return_value.wait.assert_called_once()
+
+    def started_with(self, *args):
+        """What the worker was started with, or None if it never was."""
+        wav = self.path("clip.wav")
+        wav.write_bytes(b"RIFF not really audio")
+        opts = cli.build_parser().parse_args(["transcribe", str(wav), *args])
+
+        def headless(begin, on_interrupt=None):
+            begin(lambda result: None)
+            return {"error": "stopped"}
+
+        with mock.patch.object(cli.filetranscribe, "FileTranscriber") as worker, \
+                mock.patch.object(cli, "_headless", side_effect=headless), \
+                captured() as (out, err):
+            code = cli.cmd_transcribe(opts)
+        call = worker.return_value.start.call_args
+        return code, call.args if call else None, out.getvalue() + err.getvalue()
+
+    def test_subtitles_from_a_provider_with_no_timestamps_are_refused(self):
+        self.write_config({"transcribe_provider": "gemini",
+                           "gemini_api_key": "AIza-test"})
+        for flag in ("--srt", "--timestamps"):
+            with self.subTest(flag=flag):
+                code, started, said = self.started_with(flag)
+                self.assertEqual(code, 1)
+                self.assertIsNone(started)
+                self.assertIn("Google AI Studio", said)
+
+    def test_a_stored_timestamps_setting_is_not_held_against_it(self):
+        """The window greys the switch out and keeps the setting for later."""
+        self.write_config({"transcribe_provider": "gemini",
+                           "gemini_api_key": "AIza-test",
+                           "file_timestamps": True})
+        _code, started, _ = self.started_with()
+        self.assertFalse(started[1])
+
+    def test_the_others_still_take_the_stored_setting(self):
+        self.write_config({"transcribe_provider": "openai",
+                           "openai_api_key": "sk-test",
+                           "file_timestamps": True})
+        _code, started, _ = self.started_with()
+        self.assertTrue(started[1])
 
 
 if __name__ == "__main__":

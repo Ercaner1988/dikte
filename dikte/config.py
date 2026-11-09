@@ -7,12 +7,16 @@ import os
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 from . import api
+from .presets import ALIASES, PRESETS, model_setting
 from . import ggml
+from . import hardware
 from . import i18n
 from . import paste
 from . import paths
+from . import profiles
 from .i18n import t
 
 
@@ -240,12 +244,12 @@ TIMESTAMP_RULE_TR = ("\n\nHer satır [dd:ss] biçiminde bir zaman damgasıyla ba
                      "satırları birleştirme ve sıralarını değiştirme.")
 
 # Appended on top of the timestamp rule when the lines also carry a speaker.
-SPEAKER_RULE_EN = ("\n\nAfter the timestamp each line names who was speaking, as "
+SPEAKER_RULE_EN = ("\n\nEach line, after its timestamp where it has one, names who was speaking, as "
                    "“Name:”. Keep that name exactly as it is and never move a "
                    "sentence from one speaker to another. Two people talking over "
                    "each other is normal in a meeting; leave the lines where they "
                    "are rather than tidying the order.")
-SPEAKER_RULE_TR = ("\n\nZaman damgasından sonra her satır “İsim:” biçiminde kimin "
+SPEAKER_RULE_TR = ("\n\nHer satır, zaman damgası varsa ondan sonra, “İsim:” biçiminde kimin "
                    "konuştuğunu yazıyor. İsmi olduğu gibi bırak, bir cümleyi asla "
                    "başka bir konuşmacıya taşıma. Toplantıda iki kişinin sözünün "
                    "birbirine girmesi olağandır; sırayı düzeltmeye çalışma, "
@@ -423,15 +427,26 @@ DEFAULTS = {
     "openai_api_key": "",
     "openai_base_url": "https://api.openai.com/v1",
     "groq_api_key": "",
-    "groq_base_url": "https://api.groq.com/openai/v1",
+    "groq_base_url": PRESETS["groq"].base_url,
     "openrouter_api_key": "",
     "openrouter_base_url": "https://openrouter.ai/api/v1",
+    "requesty_api_key": "",
+    # https://router.eu.requesty.ai/v1 keeps the requests in the EU.
+    "requesty_base_url": PRESETS["requesty"].base_url,
     "gemini_api_key": "",
-    # Google's OpenAI-compatible endpoint. Cleanup only: there is no
-    # /audio/transcriptions behind it, so it is not one of the TRANSCRIBERS.
-    "gemini_base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+    # Google's OpenAI-compatible endpoint. It has no /audio/transcriptions, so
+    # api.py sends dictation there as audio inside a chat request.
+    "gemini_base_url": PRESETS["gemini"].base_url,
+    "deepseek_api_key": "",
+    "deepseek_base_url": PRESETS["deepseek"].base_url,
     "opencode_api_key": "",
-    "opencode_base_url": "https://opencode.ai/zen/go/v1",
+    "opencode_base_url": PRESETS["opencode"].base_url,
+    # A server of the user's own that speaks OpenAI's API: whisper or a chat
+    # model behind /audio/transcriptions and /chat/completions. No address
+    # ships with it, and the key is optional because a server on the same
+    # network often asks for none.
+    "custom_api_key": "",
+    "custom_base_url": "",
     "transcribe_provider": "local",  # "local", or a key of TRANSCRIBERS
     "transcribe_model": "gpt-4o-transcribe",           # used when provider is openai
     "groq_transcribe_model": "whisper-large-v3-turbo",
@@ -439,10 +454,19 @@ DEFAULTS = {
     # What a timestamped run (subtitles) asks OpenRouter for: not every model
     # there returns segment times. Empty -> openai/whisper-1.
     "openrouter_file_model": "",
+    "requesty_transcribe_model": "openai/gpt-4o-transcribe",
+    # Google's fastest model that takes audio. No segment times come back.
+    "gemini_transcribe_model": "gemini-3.5-flash-lite",
+    "custom_transcribe_model": "",  # empty -> whatever the server serves
     # A stored language overrides this default. Hosted providers receive no
     # language hint in auto mode; local whisper also reports the detected code.
     "language": "auto",
+    # The personal dictionary, rendered: the records themselves live in
+    # dictionary.json (see dictionary.py), and this is kept in step with them
+    # so that an older version and `dikte config set` still read and write it.
     "transcribe_prompt": "",
+    # Learn names and terms from finished dictations. Off until asked for.
+    "dictionary_learning": False,
 
     # --- whisper.cpp, on this machine ---------------------------------------
     # The program and the model are both fetched from Settings; empty means
@@ -452,10 +476,14 @@ DEFAULTS = {
     # opens with the Download button already on the right model.
     "local_model": ggml.SUGGESTED_WHISPER,
     "local_threads": 0,             # 0 -> whisper.cpp picks
-    "local_gpu": True,
+    "local_gpu": True,               # retained for older settings files
+    "local_device": "auto",          # auto | cpu | stable Vulkan device UUID
     "local_preload": True,          # load the model while Dikte starts, rather
                                     # than on the first dictation
     "local_binary": "",             # empty -> whichever copy ggml.py finds
+    # Empty keeps the platform default. A user can choose an ASCII-only folder
+    # when whisper.cpp cannot open a model below a non-ASCII Windows profile.
+    "local_models_dir": "",
 
     "cleanup_enabled": True,
     "cleanup_provider": "openrouter",  # a name in cleanup.PROVIDERS
@@ -463,8 +491,11 @@ DEFAULTS = {
     "cleanup_claude_model": "haiku",   # Claude Code: an alias, or a full model id
     "cleanup_codex_model": "",         # empty -> whatever Codex is set to
     "cleanup_gemini_model": "gemini-3.5-flash-lite",
+    "cleanup_deepseek_model": "deepseek-flash",
     "cleanup_agy_model": "",           # empty -> whatever Antigravity is set to
     "cleanup_opencode_model": "deepseek-v4-flash",
+    "cleanup_requesty_model": "google/gemini-3.5-flash-lite",
+    "cleanup_custom_model": "",     # empty -> whatever the server serves
     "cleanup_reasoning": "",        # empty -> whatever the model does by default
 
     # --- llama.cpp, on this machine -----------------------------------------
@@ -493,6 +524,17 @@ DEFAULTS = {
     "local_idle_minutes": 10,
 
     "cleanup_prompt": "",           # empty -> language-specific default
+
+    # --- writing profiles (profiles.py) -------------------------------------
+    # Each switch takes one part away on its own. With the Default profile
+    # empty and no named one, every one of them on still changes nothing.
+    "profile_style": True,          # apply the profiles' style preferences
+    "profile_by_app": True,         # pick the profile by the program in front
+    "translation_enabled": True,    # translate where a profile asks for it
+    "style_learning": False,        # use preferences learned from examples
+    "profile_override": "",         # a named profile for everything, or ""
+    "profile_default": {},
+    "profiles": [],
     "auto_paste": True,
     "paste_shortcut": paste.desktop().shortcuts[0],   # cmd+v on a Mac
     "restore_clipboard": False,
@@ -503,6 +545,7 @@ DEFAULTS = {
     "speech_margin_db": 10.0,     # how far speech must rise above the noise floor
     "min_voiced_seconds": 0.3,
     "filter_hallucinations": True,
+    "audio_cues": False,
     # Ctrl+Space everywhere except a Mac, where macOS itself holds it for the
     # input-source switch and Cmd+Space for Spotlight: neither is ours to take,
     # so there Dikte starts on a combination a stock system leaves free.
@@ -528,8 +571,13 @@ DEFAULTS = {
     # A look at the releases page once a day, and nothing more than a look:
     # what is found opens a browser, never an installer.
     "update_check": True,
+    # A start at login goes straight to the tray, and the window waits for a
+    # click. Off, the login start opens the window the way a menu click does.
+    "start_in_tray": True,
     "file_timestamps": False,
     "file_cleanup": True,
+    "file_speakers": False,         # only offered where api.diarize_model() finds one
+    "file_wrap_lines": False,       # long SRT cues broken into balanced lines
     "file_cleanup_prompt": "",      # empty -> language-specific default
     "file_last_dir": "",
 
@@ -550,7 +598,7 @@ DEFAULTS = {
 
     # --- speaking a command to an agent -------------------------------------
     "assistant_shortcut": "",       # empty -> tray only
-    "assistant_provider": "claude",  # claude | codex | agy | openrouter
+    "assistant_provider": "claude",  # claude | codex | agy | openrouter | custom
     "assistant_model": "sonnet",    # Claude Code: an alias, or a full model id
     "assistant_permission_mode": "auto",
     "assistant_codex_model": "",    # empty -> whatever Codex is set to
@@ -558,6 +606,9 @@ DEFAULTS = {
     "assistant_openrouter_model": "google/gemini-3.5-flash",
     "assistant_agy_model": "",      # empty -> whatever Antigravity is set to
     "assistant_opencode_model": "deepseek-v4-flash",
+    "assistant_requesty_model": "google/gemini-3.5-flash",
+    "assistant_gemini_model": "gemini-3.5-flash",
+    "assistant_deepseek_model": "deepseek-flash",
     "assistant_reasoning": "",      # empty -> the model's own default
     "assistant_dir": "",            # empty -> the home directory
     "assistant_prompt": "",         # empty -> language-specific default
@@ -565,7 +616,23 @@ DEFAULTS = {
     "assistant_paste": True,        # paste the answer, not just copy it
     "assistant_session_minutes": 30,  # 0 -> every command starts fresh
     "assistant_timeout": 240,
+
+    # --- asking about selected text -------------------------------------------
+    # Off until switched on: it reads the selection, and on macOS and Windows
+    # that means pressing the copy shortcut in somebody else's window.
+    "selection_assist": False,
+    "selection_assist_shortcut": "",   # empty -> no key
 }
+
+# Keys and models keep their old storage names, including environment fallbacks.
+# Legacy base URL overrides remain readable, but preset URLs are fixed in the UI.
+for _role in ("transcribe", "cleanup", "assistant"):
+    DEFAULTS[f"{_role}_custom_preset"] = "other"
+    for _name, _preset in PRESETS.items():
+        DEFAULTS.setdefault(_preset.key, "")
+        DEFAULTS.setdefault(("custom" if _name == "other" else _name) + "_base_url", _preset.base_url)
+        DEFAULTS.setdefault(model_setting(_role, _name), "")
+
 
 # Saving the settings window used to write the whole default prompt into the
 # config, which then shadowed every later improvement to that default. These are
@@ -584,20 +651,14 @@ LEGACY_PROMPTS = {
     "a6484bb43a73f7f7569cea2d3bdf0bd89cab0d16",  # 1.4 English
 }
 
-# Every provider speech to text can run on, and the four settings that describe
-# one. A fifth is a row here rather than another branch in transcribe_target(),
-# another key row in the settings window and another line in save and load. The
-# order is the order the provider box offers them in. `service` is the name the
-# user sees; the environment variable that stands in for an empty key is the
-# name of its setting, shouted.
+# Named speech services; compatible gateways are rows in PRESETS.
 Transcriber = collections.namedtuple("Transcriber", "service key url model")
 TRANSCRIBERS = {
     "openai": Transcriber("OpenAI", "openai_api_key", "openai_base_url",
                           "transcribe_model"),
-    "groq": Transcriber("Groq", "groq_api_key", "groq_base_url",
-                        "groq_transcribe_model"),
     "openrouter": Transcriber("OpenRouter", "openrouter_api_key",
                               "openrouter_base_url", "openrouter_transcribe_model"),
+    "custom": SimpleNamespace(service="Custom server"),
 }
 
 # One lock for the history file and the meeting index both, rather than one
@@ -624,6 +685,21 @@ def _replace_with_retry(tmp, target):
             time.sleep(0.05)
 
 
+# The settings added with profiles and the dictionary, and the type each must
+# have. A value of another type (an edit by hand, a fork) falls back to the
+# default rather than reaching code that would trip over it.
+_SHAPES = {
+    "dictionary_learning": bool,
+    "profile_style": bool,
+    "profile_by_app": bool,
+    "translation_enabled": bool,
+    "style_learning": bool,
+    "profile_override": str,
+    "profile_default": dict,
+    "profiles": list,
+}
+
+
 # Corners used to be stored with Turkish names.
 _CORNER_MIGRATION = {
     "sol-alt": "bottom-left", "sağ-alt": "bottom-right",
@@ -631,17 +707,35 @@ _CORNER_MIGRATION = {
 }
 
 
+def _local_thread_count(value):
+    """A stored whole manual count, or Automatic for malformed values."""
+    if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+        return 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 class Config:
     def __init__(self):
         self.data = dict(DEFAULTS)
+        # Copies of the two containers, so that no Config can change the
+        # defaults every other one starts from.
+        self.data["profile_default"] = {}
+        self.data["profiles"] = []
         self.load()
 
     def load(self):
+        stored = {}
         try:
             with open(CONFIG_FILE, encoding="utf-8") as fh:
                 stored = json.load(fh)
             if isinstance(stored, dict):
                 self.data.update({k: v for k, v in stored.items() if k in DEFAULTS})
+                self.data["local_threads"] = _local_thread_count(
+                    self.data["local_threads"]
+                )
         except FileNotFoundError:
             pass
         except json.JSONDecodeError as exc:
@@ -658,12 +752,20 @@ class Config:
                   f"the unreadable file was kept as {broken}")
         except OSError as exc:
             print(f"dikte: could not read settings ({exc}), using defaults")
+        if not isinstance(stored, dict) or "local_device" not in stored:
+            self.data["local_device"] = (
+                "auto" if self.data["local_gpu"] else "cpu"
+            )
         self.data["overlay_corner"] = _CORNER_MIGRATION.get(
             self.data["overlay_corner"], self.data["overlay_corner"]
         )
+        for key, kind in _SHAPES.items():
+            if not isinstance(self.data[key], kind):
+                self.data[key] = type(DEFAULTS[key])(DEFAULTS[key])
         stored_prompt = self.data["cleanup_prompt"].strip()
         if stored_prompt and _fingerprint(stored_prompt) in LEGACY_PROMPTS:
             self.data["cleanup_prompt"] = ""
+        self.migrate_providers()
         i18n.set_language(self.data["ui_language"])
 
     def save(self):
@@ -685,6 +787,32 @@ class Config:
 
     def __setitem__(self, key, value):
         self.data[key] = value
+        if key in ("transcribe_provider", "cleanup_provider", "assistant_provider"):
+            self.migrate_providers()
+
+    def migrate_providers(self):
+        for role in ("transcribe", "cleanup", "assistant"):
+            name = self.data[f"{role}_provider"]
+            if name in ALIASES:
+                self.data[f"{role}_provider"] = "custom"
+                self.data[f"{role}_custom_preset"] = name
+
+    def custom_preset(self, role):
+        name = self[f"{role}_custom_preset"]
+        if not isinstance(name, str):
+            return "other"
+        preset = PRESETS.get(name, PRESETS["other"])
+        if not getattr(preset, "transcription" if role == "transcribe" else "chat"):
+            return "other"
+        return name if name in PRESETS else "other"
+
+    def custom_target(self, role):
+        name = self.custom_preset(role)
+        preset = PRESETS[name]
+        setting = "custom_base_url" if name == "other" else f"{name}_base_url"
+        return api.Target("custom", t("Custom server") if name == "other" else preset.service,
+                          self.api_key(preset.key), self.get(setting, preset.base_url).strip(),
+                          self[model_setting(role, name)].strip(), "", name)
 
     def get(self, key, default=None):
         return self.data.get(key, DEFAULTS.get(key, default))
@@ -696,17 +824,8 @@ class Config:
     def openai_key(self):
         return self.api_key("openai_api_key")
 
-    def groq_key(self):
-        return self.api_key("groq_api_key")
-
     def openrouter_key(self):
         return self.api_key("openrouter_api_key")
-
-    def gemini_key(self):
-        return self.api_key("gemini_api_key")
-
-    def opencode_key(self):
-        return self.api_key("opencode_api_key")
 
     def transcribe_target(self):
         """Key, endpoint and model for whichever provider does speech to text.
@@ -721,6 +840,8 @@ class Config:
         if name == "local":
             return api.Target("local", t("Local whisper"), "", "",
                               self["local_model"])
+        if name == "custom":
+            return self.custom_target("transcribe")
         if name not in TRANSCRIBERS:
             # A config written by a fork, or by a version that dropped one. The
             # shipped default is not in the table, so this names the hosted one
@@ -728,14 +849,21 @@ class Config:
             name = "openai"
         who = TRANSCRIBERS[name]
         file_model = self["openrouter_file_model"] if name == "openrouter" else ""
-        return api.Target(name, who.service, self.api_key(who.key),
-                          self[who.url], self[who.model], file_model.strip())
+        # t(): the custom server's name is a phrase rather than a brand, and is
+        # shown in the interface language like the rest of an error.
+        return api.Target(name, t(who.service), self.api_key(who.key),
+                          self[who.url].strip(), self[who.model].strip(),
+                          file_model.strip())
 
     def transcribe_ready(self):
         """Whether speech to text could run right now, without opening Settings."""
         if self["transcribe_provider"] == "local":
             return self.local_whisper_ready()
-        return bool(self.transcribe_target().api_key)
+        target = self.transcribe_target()
+        if target.provider == "custom":
+            # The address is what it cannot run without; a key is optional.
+            return bool(target.base_url) and (target.preset == "other" or bool(target.api_key))
+        return bool(target.api_key)
 
     def local_whisper_ready(self):
         return bool(ggml.program_path(ggml.WHISPER, self["local_binary"])
@@ -749,10 +877,23 @@ class Config:
 
     def apply_local(self):
         """Hand the local settings to the servers, restarting what they change."""
+        if ggml.set_models_dir(self["local_models_dir"]):
+            # The restart check compares model names, not where they are
+            # read from, so a server holding one from the old folder is
+            # stopped here; the next use starts it from the new one.
+            ggml.whisper.stop()
+            ggml.llm.stop()
+        device = self["local_device"]
+        if device == "auto" and not self["local_gpu"]:
+            device = "cpu"
+        requested_threads = _local_thread_count(self["local_threads"])
+        threads = (min(requested_threads, hardware.cpu_threads())
+                   if requested_threads else 0)
         ggml.whisper.configure(
             model=self["local_model"],
-            threads=int(self["local_threads"]),
-            gpu=bool(self["local_gpu"]),
+            threads=threads,
+            gpu=device != "cpu",
+            device=device,
             binary=self["local_binary"],
         )
         ggml.llm.configure(
@@ -776,7 +917,8 @@ class Config:
         return self["cleanup_provider"] == "local"
 
     def cleanup_prompt(self, with_timestamps=False, with_speakers=False,
-                       subtitles=False, speech=""):
+                       subtitles=False, speech="", participants=True,
+                       profile=None):
         """`speech` is the two-letter code of the language that was heard, when
         the transcription model reported one. The default prompts and the
         glossary rule only exist in Turkish and English, so a detected Turkish
@@ -784,26 +926,65 @@ class Config:
         none at all, the English one, which is written not to care what
         language the transcript is in. Nothing else calls this with it, so the
         interface language keeps deciding everywhere the speech was not asked
-        about."""
+        about. `participants` is whether the meeting's names belong in the
+        glossary; a file's speakers are numbered, not the people in a meeting.
+
+        `profile` is the profiles.Choice of a dictation, and only a dictation
+        passes one: files, meetings and the agent never do, so nothing about
+        a profile can reach their prompts. The prompt is built in this order,
+        each part only when there is something in it:
+
+            1. the base: the user's own cleanup instruction if there is one,
+               otherwise the built-in one; or, when translation is asked for
+               with cleanup switched off, the translate-only prompt
+            2. the glossary, from the personal dictionary
+            3. the profile's writing style (not with cleanup off: there is no
+               rewrite for it to shape)
+            4. the translation rule
+            5. the timestamp and speaker rules, which only files and meetings
+               ask for
+
+        A custom instruction replaces the built-in base and nothing else: the
+        glossary, the style and the translation are still added after it.
+        Switching the profile style off in Settings is how a custom
+        instruction is left to stand alone."""
         turkish = (speech == "tr") if speech else i18n.language() == "tr"
+        translate_only = (profile is not None and bool(profile.translate_to)
+                          and not subtitles and not self["cleanup_enabled"])
         if subtitles:
             prompt = (self["file_cleanup_prompt"].strip()
                       or (FILE_CLEANUP_PROMPT_TR if turkish
                           else FILE_CLEANUP_PROMPT_EN))
+        elif translate_only:
+            prompt = profiles.translate_only_prompt(profile, turkish)
         else:
             prompt = (self["cleanup_prompt"].strip()
                       or (CLEANUP_PROMPT_TR if turkish else CLEANUP_PROMPT_EN))
-        glossary = self["transcribe_prompt"].strip()
-        if with_speakers:
+        glossary = self.dictionary_glossary()
+        if with_speakers and participants:
             glossary = "\n".join(x for x in (glossary, self.participants()) if x)
         if glossary:
             rule = GLOSSARY_RULE_TR if turkish else GLOSSARY_RULE_EN
             prompt += rule.format(glossary=glossary)
+        if profile is not None and not subtitles and not translate_only:
+            prompt += profiles.style_section(profile, turkish)
+            prompt += profiles.translation_section(profile, turkish)
         if with_timestamps:
             prompt += TIMESTAMP_RULE_TR if turkish else TIMESTAMP_RULE_EN
         if with_speakers:
             prompt += SPEAKER_RULE_TR if turkish else SPEAKER_RULE_EN
         return prompt
+
+    def dictionary_hint(self, reserve=0):
+        """The personal dictionary as the transcription model is told it.
+        `reserve` is room left in its budget for what is added after it."""
+        from . import dictionary  # it imports this module
+        return dictionary.hint(self, reserve)
+
+    def dictionary_glossary(self):
+        """The personal dictionary as the cleanup model is told it."""
+        from . import dictionary
+        return dictionary.glossary(self)
 
     def assistant_prompt(self):
         return self["assistant_prompt"].strip() or default_assistant_prompt()
@@ -833,8 +1014,9 @@ class Config:
 
     def meeting_hint(self):
         """The transcription hint: the dictation glossary plus the names."""
-        return "\n".join(x for x in (self["transcribe_prompt"].strip(),
-                                     self.participants()) if x)
+        people = self.participants()
+        hint = self.dictionary_hint(reserve=len(people) + 1 if people else 0)
+        return "\n".join(x for x in (hint.strip(), people) if x)
 
     def speaker_names(self):
         """(mine, theirs), falling back to the interface language's defaults."""
@@ -951,6 +1133,24 @@ def amend_history(entry, **changes):
     return None
 
 
+def replace_history(entry, new):
+    """Put `new` where `entry` stood, matched on its whole content.
+
+    For a failed dictation retried from the history: the transcript takes the
+    failed row's place in the list instead of arriving as a second entry. None
+    when the row is gone, deleted or trimmed while the retry ran."""
+    wanted = _row_key(entry)
+    with _FILES_LOCK:
+        rows = _read_history()
+        for index, row in enumerate(rows):
+            if _row_key(row) == wanted:
+                rows[index] = new
+                _write_history([json.dumps(r, ensure_ascii=False) + "\n"
+                                for r in rows])
+                return new
+    return None
+
+
 def delete_history(rows):
     """Remove the given entries, matched on their whole content rather than on a
     line number: the worker may have appended a new one since the list was read."""
@@ -961,11 +1161,25 @@ def delete_history(rows):
         kept = [json.dumps(row, ensure_ascii=False) + "\n"
                 for row in _read_history() if _row_key(row) not in doomed]
         _write_history(kept)
+    # Only the names those rows held. Others may have come from rows already
+    # trimmed away; those are not tracked, and age out with the count.
+    _forget_learning([row.get(field) for row in rows for field in ("raw", "text")])
 
 
 def clear_history():
     with _FILES_LOCK:
         HISTORY_FILE.unlink(missing_ok=True)
+    _forget_learning()
+
+
+def _forget_learning(texts=None):
+    """Names still being counted for the dictionary came out of dictations, so
+    they go with the history they came from."""
+    from . import dictionary  # it imports this module
+    try:
+        dictionary.forget_pending(texts)
+    except OSError as exc:
+        print(f"dikte: could not forget the names being learned ({exc})")
 
 
 # --- meetings -------------------------------------------------------------

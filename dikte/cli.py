@@ -37,6 +37,7 @@ from . import ipc
 from . import integrate
 from . import meeting
 from . import paste
+from . import profiles
 from . import update
 from . import __version__
 
@@ -45,7 +46,7 @@ NOT_RUNNING = 3
 # Verbs that start the application when none is running, which is what a
 # shortcut registered with the desktop has always relied on: press the key on a
 # fresh login and Dikte comes up recording.
-GUI_VERBS = {"", "home", "settings", "toggle", "ask", "meeting"}
+GUI_VERBS = {"", "home", "settings", "toggle", "ask", "meeting", "assist"}
 
 # Asking a process that is not there to stop, cancel or quit is not a failure;
 # it is already in the state that was asked for.
@@ -138,8 +139,8 @@ def _ask_instance(opts, cmd, wait=False, **args):
 def launch_gui(verb=""):
     """No instance running, so become the application itself."""
     ipc.respawn(([verb] if verb else []) + ["--gui"])
-    # respawn only returns on Windows, where the application was started
-    # detached and this console process's job is over.
+    # respawn only returns where the replacement starts separately; this
+    # console process's job is then over.
     sys.exit(0)
 
 
@@ -216,10 +217,11 @@ def cmd_ask(opts):
     if opts.provider:
         conf["assistant_provider"] = opts.provider
     if opts.model:
-        key = {"claude": "assistant_model", "codex": "assistant_codex_model",
-               "openrouter": "assistant_openrouter_model",
-               "agy": "assistant_agy_model",
-               "opencode": "assistant_opencode_model"}[assistant.provider(conf)]
+        key = (cfg.model_setting("assistant", conf.custom_preset("assistant"))
+               if assistant.provider(conf) == "custom" else
+               {"claude": "assistant_model", "codex": "assistant_codex_model",
+                "openrouter": "assistant_openrouter_model", "agy": "assistant_agy_model"}
+               [assistant.provider(conf)])
         conf[key] = opts.model
     if opts.dir:
         conf["assistant_dir"] = opts.dir
@@ -280,7 +282,7 @@ def cmd_session(opts):
     minutes = None if age is None else int(age // 60)
     # The conversation on disk belongs to whoever was asked last, which is not
     # always whoever would be asked next; none of them can pick up another's.
-    owner = assistant.stored_provider()
+    owner = assistant.stored_provider(conf)
     told = f"{assistant.display_name(conf)}: "
     if minutes is None:
         told += "no conversation going."
@@ -309,7 +311,19 @@ def cmd_transcribe(opts):
     # This runs here rather than in the instance, so the local servers have to
     # be handed their settings here too; the GUI does this at startup.
     conf.apply_local()
-    timestamps = opts.srt or _pick(opts.timestamps, conf["file_timestamps"])
+    target = conf.transcribe_target()
+    if not api.gives_times(target.provider, target.preset):
+        if opts.srt or opts.timestamps:
+            return fail(opts, api.no_times(target.service))
+        # The settings window greys the switch out for this provider and
+        # leaves the setting alone, so a stored one is not what was asked.
+        timestamps = False
+    else:
+        timestamps = opts.srt or _pick(opts.timestamps, conf["file_timestamps"])
+    speakers = _pick(opts.speakers, conf["file_speakers"])
+    if opts.speakers and not api.diarize_model(target):
+        return fail(opts, "the selected transcription model is not known to "
+                          "tell speakers apart")
     worker = filetranscribe.FileTranscriber(conf)
 
     def begin(finish):
@@ -318,14 +332,19 @@ def cmd_transcribe(opts):
             lambda text, segments: finish({"text": text, "segments": segments})
         )
         worker.failed.connect(lambda error: finish({"error": error}))
-        worker.start(path, timestamps, _pick(opts.cleanup, conf["file_cleanup"]))
+        worker.start(path, timestamps, _pick(opts.cleanup, conf["file_cleanup"]),
+                     speakers)
 
     result = _headless(begin, on_interrupt=worker.stop)
+    # Finished is emitted before the worker removes its converted audio.
+    worker.wait(10)
     if result.get("error"):
         return fail(opts, result["error"])
 
     text, segments = result["text"], result["segments"]
-    srt = filetranscribe.to_srt(text, segments) if opts.srt else ""
+    srt = (filetranscribe.to_srt(text, segments,
+                                 _pick(opts.wrap, conf["file_wrap_lines"]))
+           if opts.srt else "")
     if opts.srt and not srt:
         return fail(opts, "no timestamped lines to turn into subtitles")
 
@@ -420,6 +439,8 @@ def cmd_meetings_retry(opts):
         return fail(opts, "the application is already writing this one up")
 
     conf = cfg.Config()
+    # As in transcribe, a local server is handed its settings here.
+    conf.apply_local()
     pipeline = meeting.MeetingPipeline(conf)
 
     def start(finish):
@@ -431,6 +452,8 @@ def cmd_meetings_retry(opts):
         pipeline.run(row)
 
     result = _headless(start, on_interrupt=pipeline.stop)
+    # As with transcribe: finished comes before the scratch audio is removed.
+    pipeline.wait(10)
     if result.get("error"):
         return fail(opts, result["error"], base=row["base"])
     doc_path, _wav = cfg.meeting_paths(result["base"])
@@ -462,7 +485,9 @@ def _find_history(which):
     if not rows:
         return None
     if which in ("", "last"):
-        return rows[-1]
+        # The newest transcript: a failed dictation has none to show.
+        return next((row for row in reversed(rows) if not row.get("failed")),
+                    None)
     if not which.isdigit():
         return None
     index = int(which)
@@ -474,6 +499,8 @@ def cmd_history_list(opts):
     lines = []
     for index, row in enumerate(reversed(rows), start=1):
         preview = (row.get("text") or "").replace("\n", " ")
+        if row.get("failed"):
+            preview = "failed: " + (row.get("error") or "").replace("\n", " ")
         mode = "ask " if row.get("mode") == "ask" else "    "
         lines.append(
             f"{index:>3}  {row.get('ts', ''):19}  {row.get('duration', 0):>6.1f}s  "
@@ -487,6 +514,8 @@ def cmd_history_show(opts):
     row = _find_history(opts.which)
     if row is None:
         return fail(opts, f"no such entry: {opts.which}")
+    if row.get("failed"):
+        return fail(opts, f"that dictation failed: {row.get('error', '')}")
     body = row.get("raw", "") if opts.raw else row.get("text", "")
     return out(opts, {"ok": True, **row}, body)
 
@@ -512,8 +541,7 @@ def cmd_history_clear(opts):
 
 # --- settings ---------------------------------------------------------------
 
-SECRET_KEYS = ("openai_api_key", "groq_api_key", "openrouter_api_key",
-               "gemini_api_key", "opencode_api_key")
+SECRET_KEYS = tuple(key for key in cfg.DEFAULTS if key.endswith("_api_key"))
 
 
 def _mask(key, value):
@@ -524,6 +552,9 @@ def _mask(key, value):
 
 def _coerce(key, raw):
     """A value off the command line, in the type the setting is stored as."""
+    if (key in ("transcribe_provider", "transcribe_custom_preset") and raw in cfg.ALIASES
+            and not cfg.PRESETS[raw].transcription):
+        raise ValueError(f"{cfg.PRESETS[raw].service} does not support transcription.")
     default = cfg.DEFAULTS[key]
     if isinstance(default, bool):
         lowered = raw.strip().lower()
@@ -536,6 +567,16 @@ def _coerce(key, raw):
         return int(float(raw))
     if isinstance(default, float):
         return float(raw)
+    if isinstance(default, (dict, list)):
+        # The profiles: JSON in, and of the right shape, or the next load would
+        # quietly put the default back.
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            raise ValueError(f"{key} wants JSON, got: {raw}") from None
+        if not isinstance(value, type(default)):
+            raise ValueError(f"{key} wants a JSON {type(default).__name__}")
+        return value
     return raw
 
 
@@ -570,6 +611,18 @@ def cmd_config_get(opts):
                else value)
 
 
+def _set_config_value(conf, key, value):
+    """Keep the canonical processing device and its legacy flag in sync."""
+    conf[key] = value
+    if key == "local_device":
+        conf["local_gpu"] = value != "cpu"
+    elif key == "local_gpu":
+        if not value:
+            conf["local_device"] = "cpu"
+        elif conf["local_device"] == "cpu":
+            conf["local_device"] = "auto"
+
+
 def cmd_config_set(opts):
     if opts.key not in cfg.DEFAULTS:
         return fail(opts, f"unknown setting: {opts.key}", 2)
@@ -584,7 +637,7 @@ def cmd_config_set(opts):
         return fail(opts, exc, 2)
 
     conf = cfg.Config()
-    conf[opts.key] = value
+    _set_config_value(conf, opts.key, value)
     try:
         conf.save()
     except OSError as exc:
@@ -605,7 +658,7 @@ def cmd_config_reset(opts):
         return fail(opts, f"unknown setting: {unknown[0]}", 2)
     conf = cfg.Config()
     for key in keys:
-        conf[key] = cfg.DEFAULTS[key]
+        _set_config_value(conf, key, cfg.DEFAULTS[key])
     try:
         conf.save()
     except OSError as exc:
@@ -628,7 +681,9 @@ def cmd_prompt(opts):
     """The prompt a run would really use, defaults and glossary folded in."""
     conf = cfg.Config()
     prompts = {
-        "cleanup": conf.cleanup_prompt(),
+        # As a dictation would send it with no program found in front: the
+        # Default profile, or the one chosen for every dictation.
+        "cleanup": conf.cleanup_prompt(profile=profiles.choose(conf)),
         "subtitles": conf.cleanup_prompt(subtitles=True),
         "meeting": conf.meeting_prompt(),
         "agent": conf.assistant_prompt(),
@@ -669,16 +724,27 @@ def cmd_devices(opts):
                "\n".join(lines))
 
 
+def _catalog(conf, name, transcription=False, test_key=False):
+    if name == "openrouter":
+        return api.openrouter_models(conf.openrouter_key(), transcription=transcription)
+    if name == "custom" or name in cfg.ALIASES:
+        role = "transcribe" if transcription else "cleanup"
+        conf[f"{role}_custom_preset"] = "other" if name == "custom" else name
+        target = conf.custom_target(role)
+        # Reject a chat-only alias before role validation falls back to Other.
+        if transcription and name in cfg.ALIASES and not cfg.PRESETS[name].transcription:
+            raise api.ApiError(f"{cfg.PRESETS[name].service} does not support transcription.")
+        # Legacy audio-provider listings stay audio-only; chat presets can fetch all.
+        audio = transcription or (name in cfg.ALIASES and cfg.PRESETS[name].catalog == "audio")
+        return api.preset_models(target.preset, target.api_key, target.base_url, audio, test_key)
+    who = cfg.TRANSCRIBERS[name]
+    return api.openai_models(conf.api_key(who.key), conf[who.url], who.service)
+
+
 def cmd_models(opts):
     conf = cfg.Config()
-    who = cfg.TRANSCRIBERS[opts.provider]
     try:
-        if opts.provider == "openrouter":
-            models = api.openrouter_models(conf.openrouter_key(),
-                                           transcription=opts.transcription)
-        else:
-            models = api.openai_models(conf.api_key(who.key), conf[who.url],
-                                       who.service)
+        models = _catalog(conf, opts.provider, opts.transcription)
     except api.ApiError as exc:
         return fail(opts, exc)
     return out(opts, {"ok": True, "provider": opts.provider, "models": models},
@@ -688,37 +754,20 @@ def cmd_models(opts):
 def cmd_test_key(opts):
     conf = cfg.Config()
     results = {}
-    for name, who in cfg.TRANSCRIBERS.items():
+    for name in (*cfg.TRANSCRIBERS, *cfg.ALIASES):
         if opts.which not in (name, "all"):
+            continue
+        if name == "custom" and opts.which == "all" and not conf["custom_base_url"].strip():
             continue
         try:
             if name == "openrouter":
-                # The one key that also pays for cleanup, so it reports credit
-                # rather than a model count.
                 message = api.openrouter_key_status(conf.openrouter_key())
             else:
-                count = len(api.openai_models(conf.api_key(who.key), conf[who.url],
-                                              who.service))
+                count = len(_catalog(conf, name, test_key=True))
                 message = f"connection works, {count} models visible"
             results[name] = {"ok": True, "message": message}
         except api.ApiError as exc:
             results[name] = {"ok": False, "message": str(exc)}
-    if opts.which in ("gemini", "all"):
-        try:
-            count = len(api.gemini_models(conf.gemini_key(),
-                                          conf["gemini_base_url"]))
-            message = f"connection works, {count} models visible"
-            results["gemini"] = {"ok": True, "message": message}
-        except api.ApiError as exc:
-            results["gemini"] = {"ok": False, "message": str(exc)}
-    if opts.which in ("opencode", "all"):
-        try:
-            count = len(api.openai_models(conf.opencode_key(),
-                                          conf["opencode_base_url"], "OpenCode Go"))
-            results["opencode"] = {"ok": True,
-                                   "message": f"connection works, {count} models visible"}
-        except api.ApiError as exc:
-            results["opencode"] = {"ok": False, "message": str(exc)}
     everything_ok = all(item["ok"] for item in results.values())
     lines = [f"{'✓' if item['ok'] else '✗'} {name}: {item['message']}"
              for name, item in results.items()]
@@ -930,6 +979,8 @@ def cmd_status(opts):
 def cmd_doctor(opts):
     """What the settings window checks behind its buttons, in one pass."""
     conf = cfg.Config()
+    # Where the local models are looked for is a setting too.
+    ggml.set_models_dir(conf["local_models_dir"])
     # The two the clipboard and the key press go through come out of the table
     # rather than being spelled here, because they are not the same pair on all
     # four systems: X11 pastes with xclip where Wayland pastes with wl-copy, a
@@ -958,12 +1009,14 @@ def cmd_doctor(opts):
     # has a program to find instead, and the model on this machine has neither,
     # so "no key" there has to read as beside the point rather than as one that
     # has gone missing.
-    cleanup_service, cleanup_key = {
-        "openrouter": ("OpenRouter", conf.openrouter_key()),
-        "gemini": ("Google AI Studio", conf.gemini_key()),
-        "opencode": ("OpenCode Go", conf.opencode_key()),
-    }.get(cleaner, ("", ""))
-    if cleanup_service:
+    cleanup_service, cleanup_key = "", ""
+    if cleaner == "custom":
+        cleanup_target = conf.custom_target("cleanup")
+        cleanup_key = cleanup_target.api_key
+        cleanup_service = cleanup_target.service if cleanup_target.preset != "other" else ""
+        cleanup_ready = bool(cleanup_target.base_url) and (not cleanup_service or bool(cleanup_key))
+    elif cleaner == "openrouter":
+        cleanup_service, cleanup_key = "OpenRouter", conf.openrouter_key()
         cleanup_ready = bool(cleanup_key)
     elif cleaner == "local":
         cleanup_ready = conf.local_llm_ready()
@@ -991,6 +1044,10 @@ def cmd_doctor(opts):
     if target.provider == "local":
         transcribe_line = (f"{'✓' if transcribe_ready else '✗'} {target.service}, "
                            f"transcribing on {target.model or 'no model yet'}")
+    elif target.provider == "custom" and target.preset == "other":
+        transcribe_line = (f"{'✓' if transcribe_ready else '✗'} Custom server "
+                           f"{target.base_url or '(no address)'}, transcribing on "
+                           f"{target.model or 'its default model'}")
     else:
         transcribe_line = (f"{'✓' if transcribe_ready else '✗'} {target.service} "
                            f"key, transcribing on {target.model}")
@@ -1000,6 +1057,10 @@ def cmd_doctor(opts):
     elif cleaner == "local":
         cleanup_line = (f"{'✓' if cleanup_ready else '✗'} Local model, "
                         f"cleaning up on {conf['local_llm_model'] or 'no model yet'}")
+    elif cleaner == "custom":
+        cleanup_line = (f"{'✓' if cleanup_ready else '✗'} Custom server "
+                        f"{cleanup_target.base_url or '(no address)'}, cleaning up "
+                        f"on {cleanup_target.model or 'its default model'}")
     else:
         # Cleanup on a CLI needs no key, so what is checked is the program.
         cleanup_line = (f"{'✓' if cleanup_ready else '✗'} "
@@ -1040,6 +1101,7 @@ EPILOG = """\
 examples:
   dikte record --seconds 8 --json
   dikte transcribe talk.mp4 --srt -o talk.srt
+  dikte transcribe talk.mp4 --srt --wrap -o talk.srt
   dikte ask "put that in my calendar on Thursday at three"
   dikte config set cleanup_model google/gemini-3.5-flash
   dikte history show 1
@@ -1115,7 +1177,7 @@ def build_parser():
     ask = leaf(subs, "ask", "put a command to the agent")
     ask.add_argument("text", nargs="*", help="the command; read from stdin, or "
                                              "recorded when there is none")
-    ask.add_argument("--provider", choices=assistant.PROVIDERS,
+    ask.add_argument("--provider", choices=(*assistant.PROVIDERS, *cfg.ALIASES),
                      help="just for this run")
     ask.add_argument("--model", help="just for this run")
     ask.add_argument("--dir", help="working directory, just for this run")
@@ -1136,6 +1198,9 @@ def build_parser():
 
     for name in ("ask-cancel", "ask-reset"):
         leaf(subs, name).set_defaults(func=cmd_plain)
+    # The key the desktop binds; it does nothing unless switched on in Settings.
+    leaf(subs, "assist", "ask the agent about the selected text"
+         ).set_defaults(func=cmd_plain)
 
     # --- a file -----------------------------------------------------------
     transcribe = leaf(subs, "transcribe", "transcribe an audio or video file")
@@ -1143,10 +1208,16 @@ def build_parser():
     transcribe.add_argument("-o", "--out", help="write here instead of stdout")
     transcribe.add_argument("--srt", action="store_true",
                             help="subtitles rather than plain text")
+    transcribe.add_argument("--wrap", action=argparse.BooleanOptionalAction,
+                            default=None, help="break long subtitle lines "
+                            "into balanced lines (with --srt)")
     transcribe.add_argument("--timestamps", action=argparse.BooleanOptionalAction,
                             default=None, help="[mm:ss] in front of every line")
     transcribe.add_argument("--cleanup", action=argparse.BooleanOptionalAction,
                             default=None, help="run the cleanup model over it")
+    transcribe.add_argument("--speakers", action=argparse.BooleanOptionalAction,
+                            default=None, help="label who is talking, where the "
+                            "model is known to")
     transcribe.set_defaults(func=cmd_transcribe)
 
     # --- meetings ---------------------------------------------------------
@@ -1234,14 +1305,14 @@ def build_parser():
     # --- the machine ------------------------------------------------------
     leaf(subs, "devices", "microphones and monitors").set_defaults(func=cmd_devices)
     models = leaf(subs, "models", "model ids a provider offers")
-    models.add_argument("--provider", choices=tuple(cfg.TRANSCRIBERS),
+    models.add_argument("--provider", choices=(*cfg.TRANSCRIBERS, *cfg.ALIASES),
                         default="openrouter")
     models.add_argument("--transcription", action="store_true",
                         help="only the speech-to-text ones")
     models.set_defaults(func=cmd_models)
     test = leaf(subs, "test-key", "check the API keys")
     test.add_argument("which", nargs="?", default="all",
-                      choices=("all", *cfg.TRANSCRIBERS, "gemini", "opencode"))
+                      choices=("all", *cfg.TRANSCRIBERS, *cfg.ALIASES))
     test.set_defaults(func=cmd_test_key)
     leaf(subs, "doctor", "keys, programs, and what is missing").set_defaults(func=cmd_doctor)
 
